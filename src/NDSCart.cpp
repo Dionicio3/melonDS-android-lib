@@ -29,6 +29,8 @@
 #include "melonDLDI.h"
 #include "NDSCart_SRAMManager.h"
 
+// SRAM TODO: emulate write delays???
+
 namespace NDSCart_SRAM
 {
 
@@ -472,6 +474,10 @@ namespace NDSCart
 u16 SPICnt;
 u32 ROMCnt;
 
+u8 SPIData;
+u32 SPIDataPos;
+bool SPIHold;
+
 u8 ROMCommand[8];
 u32 ROMData;
 
@@ -488,22 +494,12 @@ u32 CartID;
 bool CartIsHomebrew;
 bool CartIsDSi;
 
-FILE* CartSD;
-
-u32 CmdEncMode;
-u32 DataEncMode;
+CartCommon* Cart;
 
 u32 Key1_KeyBuf[0x412];
 
 u64 Key2_X;
 u64 Key2_Y;
-
-
-void ROMCommand_Retail(u8* cmd);
-void ROMCommand_RetailNAND(u8* cmd);
-void ROMCommand_Homebrew(u8* cmd);
-
-void (*ROMCommandHandler)(u8* cmd);
 
 
 u32 ByteSwap(u32 val)
@@ -622,82 +618,861 @@ void ApplyModcrypt(u32 addr, u32 len, u8* iv)
 }
 
 
-bool Init()
+CartCommon::CartCommon(u8* rom, u32 len, u32 chipid)
 {
-    if (!NDSCart_SRAM::Init()) return false;
+    ROM = rom;
+    ROMLength = len;
+    ChipID = chipid;
 
-    CartROM = NULL;
-
-    CartSD = NULL;
-
-    return true;
+    u8 unitcode = ROM[0x12];
+    IsDSi = (unitcode & 0x02) != 0;
 }
 
-void DeInit()
+CartCommon::~CartCommon()
 {
-    if (CartROM) delete[] CartROM;
-
-    if (CartSD) fclose(CartSD);
-
-    NDSCart_SRAM::DeInit();
 }
 
-void Reset()
+void CartCommon::Reset()
 {
-    CartInserted = false;
-    if (CartROM) delete[] CartROM;
-    CartROM = NULL;
-    CartROMSize = 0;
-    CartID = 0;
-    CartIsHomebrew = false;
-    CartIsDSi = false;
-
-    if (CartSD) fclose(CartSD);
-    CartSD = NULL;
-
-    ROMCommandHandler = NULL;
-
-    NDSCart_SRAM::Reset();
-
-    ResetCart();
+    CmdEncMode = 0;
+    DataEncMode = 0;
 }
 
-void DoSavestate(Savestate* file)
+void CartCommon::SetupDirectBoot()
 {
-    file->Section("NDSC");
+    CmdEncMode = 2;
+    DataEncMode = 2;
+}
 
-    file->Var16(&SPICnt);
-    file->Var32(&ROMCnt);
+void CartCommon::DoSavestate(Savestate* file)
+{
+    // TODO?
+}
 
-    file->VarArray(ROMCommand, 8);
-    file->Var32(&ROMData);
+void CartCommon::LoadSave(const char* path, u32 type)
+{
+}
 
-    file->VarArray(TransferData, 0x4000);
-    file->Var32(&TransferPos);
-    file->Var32(&TransferLen);
-    file->Var32(&TransferDir);
-    file->VarArray(TransferCmd, 8);
+void CartCommon::RelocateSave(const char* path, bool write)
+{
+}
 
-    // cart inserted/len/ROM/etc should be already populated
-    // savestate should be loaded after the right game is loaded
-    // (TODO: system to verify that indeed the right ROM is loaded)
-    // (what to CRC? whole ROM? code binaries? latter would be more convenient for ie. romhaxing)
+void CartCommon::FlushSRAMFile()
+{
+}
 
-    file->Var32(&CmdEncMode);
-    file->Var32(&DataEncMode);
+int CartCommon::ROMCommandStart(u8* cmd, u8* data, u32 len)
+{
+    switch (cmd[0])
+    {
+    case 0x9F:
+        memset(data, 0xFF, len);
+        return 0;
 
-    // TODO: check KEY1 shit??
+    case 0x00:
+        memset(data, 0, len);
+        if (len > 0x1000)
+        {
+            ReadROM(0, 0x1000, data, 0);
+            for (u32 pos = 0x1000; pos < len; pos += 0x1000)
+                memcpy(data+pos, data, 0x1000);
+        }
+        else
+            ReadROM(0, len, data, 0);
+        return 0;
 
-    NDSCart_SRAM::DoSavestate(file);
+    case 0x90:
+    case 0xB8:
+        for (u32 pos = 0; pos < len; pos += 4)
+            *(u32*)&data[pos] = ChipID;
+        return 0;
+
+    case 0x3C:
+        CmdEncMode = 1;
+        Key1_InitKeycode(false, *(u32*)&ROM[0xC], 2, 2);
+        return 0;
+
+    case 0x3D:
+        if (IsDSi)
+        {
+            CmdEncMode = 11;
+            Key1_InitKeycode(true, *(u32*)&ROM[0xC], 1, 2);
+        }
+        return 0;
+
+    default:
+        if (CmdEncMode == 1 || CmdEncMode == 11)
+        {
+            // decrypt the KEY1 command as needed
+            // (KEY2 commands do not need decrypted because KEY2 is handled entirely by hardware,
+            // but KEY1 is not, so DS software is responsible for encrypting KEY1 commands)
+            u8 cmddec[8];
+            *(u32*)&cmddec[0] = ByteSwap(*(u32*)&cmd[4]);
+            *(u32*)&cmddec[4] = ByteSwap(*(u32*)&cmd[0]);
+            Key1_Decrypt((u32*)cmddec);
+            u32 tmp = ByteSwap(*(u32*)&cmddec[4]);
+            *(u32*)&cmddec[4] = ByteSwap(*(u32*)&cmddec[0]);
+            *(u32*)&cmddec[0] = tmp;
+
+            // TODO eventually: verify all the command parameters and shit
+
+            switch (cmddec[0] & 0xF0)
+            {
+            case 0x40:
+                DataEncMode = 2;
+                return 0;
+
+            case 0x10:
+                for (u32 pos = 0; pos < len; pos += 4)
+                    *(u32*)&data[pos] = ChipID;
+                return 0;
+
+            case 0x20:
+                {
+                    u32 addr = (cmddec[2] & 0xF0) << 8;
+                    if (CmdEncMode == 11)
+                    {
+                        // the DSi region starts with 0x3000 unreadable bytes
+                        // similarly to how the DS region starts at 0x1000 with 0x3000 unreadable bytes
+                        // these contain data for KEY1 crypto
+                        u32 dsiregion = *(u16*)&ROM[0x92] << 19;
+                        addr -= 0x1000;
+                        addr += dsiregion;
+                    }
+                    ReadROM(addr, 0x1000, data, 0);
+                }
+                return 0;
+
+            case 0xA0:
+                CmdEncMode = 2;
+                return 0;
+            }
+        }
+        return 0;
+    }
+}
+
+void CartCommon::ROMCommandFinish(u8* cmd, u8* data, u32 len)
+{
+}
+
+u8 CartCommon::SPIWrite(u8 val, u32 pos, bool last)
+{
+    return 0xFF;
+}
+
+void CartCommon::ReadROM(u32 addr, u32 len, u8* data, u32 offset)
+{
+    if (addr >= ROMLength) return;
+    if ((addr+len) > ROMLength)
+        len = ROMLength - addr;
+
+    memcpy(data+offset, ROM+addr, len);
 }
 
 
-void ApplyDLDIPatch(const u8* patch, u32 len)
+CartRetail::CartRetail(u8* rom, u32 len, u32 chipid) : CartCommon(rom, len, chipid)
 {
-    u32 offset = *(u32*)&CartROM[0x20];
-    u32 size = *(u32*)&CartROM[0x2C];
+    SRAM = nullptr;
+}
 
-    u8* binary = &CartROM[offset];
+CartRetail::~CartRetail()
+{
+    if (SRAM) delete[] SRAM;
+}
+
+void CartRetail::Reset()
+{
+    SRAMCmd = 0;
+    SRAMAddr = 0;
+    SRAMStatus = 0;
+}
+
+void CartRetail::DoSavestate(Savestate* file)
+{
+    // TODO?
+}
+
+void CartRetail::LoadSave(const char* path, u32 type)
+{
+    if (SRAM) delete[] SRAM;
+
+    strncpy(SRAMPath, path, 1023);
+    SRAMPath[1023] = '\0';
+
+    if (type > 9) type = 0;
+    int sramlen[] = {0, 512, 8192, 65536, 128*1024, 256*1024, 512*1024, 1024*1024, 8192*1024, 8192*1024};
+    SRAMLength = sramlen[type];
+
+    if (SRAMLength)
+    {
+        SRAM = new u8[SRAMLength];
+        memset(SRAM, 0xFF, SRAMLength);
+    }
+
+    FILE* f = Platform::OpenFile(path, "rb");
+    if (f)
+    {
+        fseek(f, 0, SEEK_SET);
+        fread(SRAM, 1, SRAMLength, f);
+
+        fclose(f);
+    }
+
+    SRAMFileDirty = false;
+    NDSCart_SRAMManager::Setup(path, SRAM, SRAMLength);
+
+    switch (type)
+    {
+    case 1: SRAMType = 1; break; // EEPROM, small
+    case 2:
+    case 3:
+    case 4: SRAMType = 2; break; // EEPROM, regular
+    case 5:
+    case 6:
+    case 7:
+    case 8: SRAMType = 3; break; // FLASH
+    case 9: SRAMType = 4; break; // NAND
+    default: SRAMType = 0; break; // ...whatever else
+    }
+}
+
+void CartRetail::RelocateSave(const char* path, bool write)
+{
+    if (!write)
+    {
+        LoadSave(path, 0); // lazy
+        return;
+    }
+
+    strncpy(SRAMPath, path, 1023);
+    SRAMPath[1023] = '\0';
+
+    FILE* f = Platform::OpenFile(path, "wb");
+    if (!f)
+    {
+        printf("NDSCart_SRAM::RelocateSave: failed to create new file. fuck\n");
+        return;
+    }
+
+    fwrite(SRAM, SRAMLength, 1, f);
+    fclose(f);
+}
+
+void CartRetail::FlushSRAMFile()
+{
+    if (!SRAMFileDirty) return;
+
+    SRAMFileDirty = false;
+    NDSCart_SRAMManager::RequestFlush();
+}
+
+int CartRetail::ROMCommandStart(u8* cmd, u8* data, u32 len)
+{
+    switch (cmd[0])
+    {
+    case 0xB7:
+        {
+            u32 addr = (cmd[1]<<24) | (cmd[2]<<16) | (cmd[3]<<8) | cmd[4];
+            memset(data, 0, len);
+
+            if (((addr + len - 1) >> 12) != (addr >> 12))
+            {
+                u32 len1 = 0x1000 - (addr & 0xFFF);
+                ReadROM_B7(addr, len1, data, 0);
+                ReadROM_B7(addr+len1, len-len1, data, len1);
+            }
+            else
+                ReadROM_B7(addr, len, data, 0);
+        }
+        return 0;
+
+    default:
+        return CartCommon::ROMCommandStart(cmd, data, len);
+    }
+}
+
+u8 CartRetail::SPIWrite(u8 val, u32 pos, bool last)
+{
+    if (SRAMType == 0) return 0;
+
+    if (pos == 0)
+    {
+        // handle generic commands with no parameters
+        switch (val)
+        {
+        case 0x04: // write disable
+            SRAMStatus &= ~(1<<1);
+            break;
+        case 0x06: // write enable
+            SRAMStatus |= (1<<1);
+            break;
+
+        default:
+            SRAMCmd = val;
+            SRAMAddr = 0;
+        }
+
+        return val;
+    }
+
+    switch (SRAMType)
+    {
+    case 1: return SRAMWrite_EEPROMTiny(val, pos, last);
+    case 2: return SRAMWrite_EEPROM(val, pos, last);
+    case 3: return SRAMWrite_FLASH(val, pos, last);
+    default: return 0;
+    }
+
+    //SRAMFileDirty |= last && (SRAMCmd == 0x02 || SRAMCmd == 0x0A);
+    //return ret;
+}
+
+void CartRetail::ReadROM_B7(u32 addr, u32 len, u8* data, u32 offset)
+{
+    addr &= (ROMLength-1);
+
+    if (addr < 0x8000)
+        addr = 0x8000 + (addr & 0x1FF);
+
+    // TODO: protect DSi secure area
+    // also protect DSi region if not unlocked
+    // and other security shenanigans
+
+    memcpy(data+offset, ROM+addr, len);
+}
+
+u8 CartRetail::SRAMWrite_EEPROMTiny(u8 val, u32 pos, bool last)
+{
+    switch (SRAMCmd)
+    {
+    case 0x01: // write status register
+        // TODO: WP bits should be nonvolatile!
+        if (pos == 1)
+            SRAMStatus = (SRAMStatus & 0x01) | (val & 0x0C);
+        return val;
+
+    case 0x05: // read status register
+        return SRAMStatus | 0xF0;
+
+    case 0x02: // write low
+    case 0x0A: // write high
+        if (pos < 2)
+        {
+            SRAMAddr = val;
+        }
+        else
+        {
+            // TODO: implement WP bits!
+            if (SRAMStatus & (1<<1))
+            {
+                SRAM[(SRAMAddr + ((SRAMCmd==0x0A)?0x100:0)) & 0x1FF] = val;
+                SRAMFileDirty |= last;
+            }
+            SRAMAddr++;
+        }
+        if (last) SRAMStatus &= ~(1<<1);
+        return val;
+
+    case 0x03: // read low
+    case 0x0B: // read high
+        if (pos < 2)
+        {
+            SRAMAddr = val;
+            return val;
+        }
+        else
+        {
+            u8 ret = SRAM[(SRAMAddr + ((SRAMCmd==0x0B)?0x100:0)) & 0x1FF];
+            SRAMAddr++;
+            return ret;
+        }
+
+    case 0x9F: // read JEDEC ID
+        return 0xFF;
+
+    default:
+        if (pos == 1)
+            printf("unknown tiny EEPROM save command %02X\n", SRAMCmd);
+        return val;
+    }
+}
+
+u8 CartRetail::SRAMWrite_EEPROM(u8 val, u32 pos, bool last)
+{
+    u32 addrsize = 2;
+    if (SRAMLength > 65536) addrsize++;
+
+    switch (SRAMCmd)
+    {
+    case 0x01: // write status register
+        // TODO: WP bits should be nonvolatile!
+        if (pos == 1)
+            SRAMStatus = (SRAMStatus & 0x01) | (val & 0x0C);
+        return val;
+
+    case 0x05: // read status register
+        return SRAMStatus;
+
+    case 0x02: // write
+        if (pos <= addrsize)
+        {
+            SRAMAddr <<= 8;
+            SRAMAddr |= val;
+        }
+        else
+        {
+            // TODO: implement WP bits
+            if (SRAMStatus & (1<<1))
+            {
+                SRAM[SRAMAddr & (SRAMLength-1)] = val;
+                SRAMFileDirty |= last;
+            }
+            SRAMAddr++;
+        }
+        if (last) SRAMStatus &= ~(1<<1);
+        return val;
+
+    case 0x03: // read
+        if (pos <= addrsize)
+        {
+            SRAMAddr <<= 8;
+            SRAMAddr |= val;
+            return val;
+        }
+        else
+        {
+            // TODO: size limit!!
+            u8 ret = SRAM[SRAMAddr & (SRAMLength-1)];
+            SRAMAddr++;
+            return ret;
+        }
+
+    case 0x9F: // read JEDEC ID
+        // TODO: GBAtek implies it's not always all FF (FRAM)
+        return 0xFF;
+
+    default:
+        if (pos == 1)
+            printf("unknown EEPROM save command %02X\n", SRAMCmd);
+        return val;
+    }
+}
+
+u8 CartRetail::SRAMWrite_FLASH(u8 val, u32 pos, bool last)
+{
+    switch (SRAMCmd)
+    {
+    case 0x05: // read status register
+        return SRAMStatus;
+
+    case 0x02: // page program
+        if (pos <= 3)
+        {
+            SRAMAddr <<= 8;
+            SRAMAddr |= val;
+        }
+        else
+        {
+            if (SRAMStatus & (1<<1))
+            {
+                // CHECKME: should it be &=~val ??
+                SRAM[SRAMAddr & (SRAMLength-1)] = 0;
+                SRAMFileDirty |= last;
+            }
+            SRAMAddr++;
+        }
+        if (last) SRAMStatus &= ~(1<<1);
+        return val;
+
+    case 0x03: // read
+        if (pos <= 3)
+        {
+            SRAMAddr <<= 8;
+            SRAMAddr |= val;
+            return val;
+        }
+        else
+        {
+            u8 ret = SRAM[SRAMAddr & (SRAMLength-1)];
+            SRAMAddr++;
+            return ret;
+        }
+
+    case 0x0A: // page write
+        if (pos <= 3)
+        {
+            SRAMAddr <<= 8;
+            SRAMAddr |= val;
+        }
+        else
+        {
+            if (SRAMStatus & (1<<1))
+            {
+                SRAM[SRAMAddr & (SRAMLength-1)] = val;
+                SRAMFileDirty |= last;
+            }
+            SRAMAddr++;
+        }
+        if (last) SRAMStatus &= ~(1<<1);
+        return val;
+
+    case 0x9F: // read JEDEC IC
+        // GBAtek says it should be 0xFF. verify?
+        return 0xFF;
+
+    case 0xD8: // sector erase
+        if (pos <= 3)
+        {
+            SRAMAddr <<= 8;
+            SRAMAddr |= val;
+        }
+        if ((pos == 3) && (SRAMStatus & (1<<1)))
+        {
+            for (u32 i = 0; i < 0x10000; i++)
+            {
+                SRAM[SRAMAddr & (SRAMLength-1)] = 0;
+                SRAMAddr++;
+            }
+            SRAMFileDirty = true;
+        }
+        if (last) SRAMStatus &= ~(1<<1);
+        return val;
+
+    case 0xDB: // page erase
+        if (pos <= 3)
+        {
+            SRAMAddr <<= 8;
+            SRAMAddr |= val;
+        }
+        if ((pos == 3) && (SRAMStatus & (1<<1)))
+        {
+            for (u32 i = 0; i < 0x100; i++)
+            {
+                SRAM[SRAMAddr & (SRAMLength-1)] = 0;
+                SRAMAddr++;
+            }
+            SRAMFileDirty = true;
+        }
+        if (last) SRAMStatus &= ~(1<<1);
+        return val;
+
+    default:
+        if (pos == 1)
+            printf("unknown FLASH save command %02X\n", SRAMCmd);
+        return val;
+    }
+}
+
+
+CartRetailNAND::CartRetailNAND(u8* rom, u32 len, u32 chipid) : CartRetail(rom, len, chipid)
+{
+}
+
+CartRetailNAND::~CartRetailNAND()
+{
+}
+
+void CartRetailNAND::Reset()
+{
+    SRAMAddr = 0;
+    SRAMStatus = 0x20;
+    SRAMWindow = 0;
+
+    // ROM header 94/96 = SRAM addr start / 0x20000
+    SRAMBase = *(u16*)&ROM[0x96] << 17;
+
+    memset(SRAMWriteBuffer, 0, 0x800);
+}
+
+void CartRetailNAND::DoSavestate(Savestate* file)
+{
+    // TODO?
+}
+
+void CartRetailNAND::LoadSave(const char* path, u32 type)
+{
+    CartRetail::LoadSave(path, type);
+
+    // the last 128K of the SRAM are read-only.
+    // most of it is FF, except for the NAND ID at the beginning
+    // of the last 0x800 bytes.
+
+    if (SRAMLength > 0x20000)
+    {
+        memset(&SRAM[SRAMLength - 0x20000], 0xFF, 0x20000);
+
+        // TODO: check what the data is all about!
+        // this was pulled from a Jam with the Band cart. may be different on other carts.
+        // WarioWare DIY may have different data or not have this at all.
+        // the ID data is also found in the response to command 94, and JwtB checks it.
+        // WarioWare doesn't seem to care.
+        // there is also more data here, but JwtB doesn't seem to care.
+        u8 iddata[0x10] = {0xEC, 0x00, 0x9E, 0xA1, 0x51, 0x65, 0x34, 0x35, 0x30, 0x35, 0x30, 0x31, 0x19, 0x19, 0x02, 0x0A};
+        memcpy(&SRAM[SRAMLength - 0x800], iddata, 16);
+    }
+}
+
+int CartRetailNAND::ROMCommandStart(u8* cmd, u8* data, u32 len)
+{
+    switch (cmd[0])
+    {
+    case 0x81: // write data
+        if ((SRAMStatus & (1<<4)) && SRAMWindow >= SRAMBase && SRAMWindow < (SRAMBase+0x800000))
+        {
+            u32 addr = (cmd[1]<<24) | (cmd[2]<<16) | (cmd[3]<<8) | cmd[4];
+
+            // the command is issued 4 times, each with the same address
+            // seems they use the one from the first command (CHECKME)
+            if (!SRAMAddr)
+                SRAMAddr = addr;
+        }
+        else
+            SRAMAddr = 0;
+        return 1;
+
+    case 0x82: // commit write
+        if (SRAMAddr && SRAMWritePos)
+        {
+            if (SRAMLength && SRAMAddr < (SRAMBase+SRAMLength-0x20000))
+            {
+                memcpy(&SRAM[SRAMAddr - SRAMBase], SRAMWriteBuffer, 0x800);
+                SRAMFileDirty = true;
+            }
+
+            SRAMAddr = 0;
+            SRAMWritePos = 0;
+        }
+        SRAMStatus &= ~(1<<4);
+        return 0;
+
+    case 0x84: // discard write buffer
+        SRAMAddr = 0;
+        SRAMWritePos = 0;
+        return 0;
+
+    case 0x85: // write enable
+        if (SRAMWindow)
+        {
+            SRAMStatus |= (1<<4);
+            SRAMWritePos = 0;
+        }
+        return 0;
+
+    case 0x8B: // revert to ROM read mode
+        SRAMWindow = 0;
+        return 0;
+
+    case 0x94: // return ID data
+        {
+            // TODO: check what the data really is. probably the NAND chip's ID.
+            // also, might be different between different games or even between different carts.
+            // this was taken from a Jam with the Band cart.
+            u8 iddata[0x30] =
+            {
+                0xEC, 0xF1, 0x00, 0x95, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+            };
+
+            if (SRAMLength) memcpy(&iddata[0x18], &SRAM[SRAMLength - 0x800], 16);
+
+            memset(data, 0, len);
+            memcpy(data, iddata, std::min(len, 0x30u));
+        }
+        return 0;
+
+    case 0xB2: // set window for accessing SRAM
+        {
+            u32 addr = (cmd[1]<<24) | ((cmd[2]&0xFE)<<16);
+
+            // window is 0x20000 bytes, address is aligned to that boundary
+            // NAND remains stuck 'busy' forever if this is less than the starting SRAM address
+            // TODO.
+
+            SRAMWindow = addr;
+        }
+        return 0;
+
+    case 0xB7:
+        {
+            u32 addr = (cmd[1]<<24) | (cmd[2]<<16) | (cmd[3]<<8) | cmd[4];
+
+            if (SRAMWindow == 0)
+            {
+                // regular ROM mode
+                memset(data, 0, len);
+
+                if (((addr + len - 1) >> 12) != (addr >> 12))
+                {
+                    u32 len1 = 0x1000 - (addr & 0xFFF);
+                    ReadROM_B7(addr, len1, data, 0);
+                    ReadROM_B7(addr+len1, len-len1, data, len1);
+                }
+                else
+                    ReadROM_B7(addr, len, data, 0);
+            }
+            else
+            {
+                // SRAM mode
+                memset(data, 0xFF, len);
+
+                if (SRAMWindow >= SRAMBase && SRAMWindow < (SRAMBase+SRAMLength) &&
+                    addr >= SRAMWindow && addr < (SRAMWindow+0x20000))
+                {
+                    memcpy(data, &SRAM[addr - SRAMBase], len);
+                }
+            }
+        }
+        return 0;
+
+    case 0xD6: // read NAND status
+        {
+            // status bits
+            // bit5: ready
+            // bit4: write enable
+
+            for (u32 i = 0; i < len; i+=4)
+                *(u32*)&data[i] = SRAMStatus * 0x01010101;
+        }
+        return 0;
+
+    default:
+        return CartRetail::ROMCommandStart(cmd, data, len);
+    }
+}
+
+void CartRetailNAND::ROMCommandFinish(u8* cmd, u8* data, u32 len)
+{
+    switch (cmd[0])
+    {
+    case 0x81: // write data
+        if (SRAMAddr)
+        {
+            if ((SRAMWritePos + len) > 0x800)
+                len = 0x800 - SRAMWritePos;
+
+            memcpy(&SRAMWriteBuffer[SRAMWritePos], data, len);
+            SRAMWritePos += len;
+        }
+        return;
+
+    default:
+        return CartCommon::ROMCommandFinish(cmd, data, len);
+    }
+}
+
+u8 CartRetailNAND::SPIWrite(u8 val, u32 pos, bool last)
+{
+    return 0xFF;
+}
+
+
+//
+
+
+CartHomebrew::CartHomebrew(u8* rom, u32 len, u32 chipid) : CartCommon(rom, len, chipid)
+{
+    if (Config::DLDIEnable)
+    {
+        ApplyDLDIPatch(melonDLDI, sizeof(melonDLDI));
+        SDFile = Platform::OpenLocalFile(Config::DLDISDPath, "r+b");
+    }
+    else
+        SDFile = nullptr;
+}
+
+CartHomebrew::~CartHomebrew()
+{
+    if (SDFile) fclose(SDFile);
+}
+
+void CartHomebrew::Reset()
+{
+    if (SDFile) fclose(SDFile);
+
+    if (Config::DLDIEnable)
+        SDFile = Platform::OpenLocalFile(Config::DLDISDPath, "r+b");
+    else
+        SDFile = nullptr;
+}
+
+void CartHomebrew::DoSavestate(Savestate* file)
+{
+    // TODO?
+}
+
+int CartHomebrew::ROMCommandStart(u8* cmd, u8* data, u32 len)
+{
+    switch (cmd[0])
+    {
+    case 0xB7:
+        {
+            u32 addr = (cmd[1]<<24) | (cmd[2]<<16) | (cmd[3]<<8) | cmd[4];
+            memset(data, 0, len);
+
+            if (((addr + len - 1) >> 12) != (addr >> 12))
+            {
+                u32 len1 = 0x1000 - (addr & 0xFFF);
+                ReadROM_B7(addr, len1, data, 0);
+                ReadROM_B7(addr+len1, len-len1, data, len1);
+            }
+            else
+                ReadROM_B7(addr, len, data, 0);
+        }
+        return 0;
+
+    case 0xC0: // SD read
+        {
+            u32 sector = (cmd[1]<<24) | (cmd[2]<<16) | (cmd[3]<<8) | cmd[4];
+            u64 addr = sector * 0x200ULL;
+
+            if (SDFile)
+            {
+                fseek(SDFile, addr, SEEK_SET);
+                fread(data, len, 1, SDFile);
+            }
+        }
+        return 0;
+
+    case 0xC1: // SD write
+        return 1;
+
+    default:
+        return CartCommon::ROMCommandStart(cmd, data, len);
+    }
+}
+
+void CartHomebrew::ROMCommandFinish(u8* cmd, u8* data, u32 len)
+{
+    // TODO: delayed SD writing? like we have for SRAM
+
+    switch (cmd[0])
+    {
+    case 0xC1:
+        {
+            u32 sector = (cmd[1]<<24) | (cmd[2]<<16) | (cmd[3]<<8) | cmd[4];
+            u64 addr = sector * 0x200ULL;
+
+            if (SDFile)
+            {
+                fseek(SDFile, addr, SEEK_SET);
+                fwrite(data, len, 1, SDFile);
+            }
+        }
+        break;
+
+    default:
+        return CartCommon::ROMCommandFinish(cmd, data, len);
+    }
+}
+
+void CartHomebrew::ApplyDLDIPatch(const u8* patch, u32 patchlen)
+{
+    u32 offset = *(u32*)&ROM[0x20];
+    u32 size = *(u32*)&ROM[0x2C];
+
+    u8* binary = &ROM[offset];
     u32 dldioffset = 0;
 
     for (u32 i = 0; i < size; i++)
@@ -723,14 +1498,12 @@ void ApplyDLDIPatch(const u8* patch, u32 len)
         *(u32*)&patch[8] != 0x006D6873)
     {
         printf("bad DLDI patch\n");
-        delete[] patch;
         return;
     }
 
     if (patch[0x0D] > binary[dldioffset+0x0F])
     {
         printf("DLDI driver ain't gonna fit, sorry\n");
-        delete[] patch;
         return;
     }
 
@@ -747,7 +1520,7 @@ void ApplyDLDIPatch(const u8* patch, u32 len)
     u32 patchsize = 1 << patch[0x0D];
     u32 patchend = patchbase + patchsize;
 
-    memcpy(&binary[dldioffset], patch, len);
+    memcpy(&binary[dldioffset], patch, patchlen);
 
     *(u32*)&binary[dldioffset+0x40] += delta;
     *(u32*)&binary[dldioffset+0x44] += delta;
@@ -812,6 +1585,88 @@ void ApplyDLDIPatch(const u8* patch, u32 len)
     }
 
     printf("applied DLDI patch\n");
+}
+
+void CartHomebrew::ReadROM_B7(u32 addr, u32 len, u8* data, u32 offset)
+{
+    // TODO: how strict should this be for homebrew?
+
+    addr &= (ROMLength-1);
+
+    memcpy(data+offset, ROM+addr, len);
+}
+
+
+/*void ROMCommand_Retail(u8* cmd);
+void ROMCommand_RetailNAND(u8* cmd);
+void ROMCommand_Homebrew(u8* cmd);
+
+void (*ROMCommandHandler)(u8* cmd);*/
+
+
+bool Init()
+{
+    if (!NDSCart_SRAM::Init()) return false;
+
+    CartROM = nullptr;
+    Cart = nullptr;
+
+    return true;
+}
+
+void DeInit()
+{
+    if (CartROM) delete[] CartROM;
+    if (Cart) delete Cart;
+
+    NDSCart_SRAM::DeInit();
+}
+
+void Reset()
+{
+    CartInserted = false;
+    if (CartROM) delete[] CartROM;
+    CartROM = nullptr;
+    CartROMSize = 0;
+    CartID = 0;
+    CartIsHomebrew = false;
+    CartIsDSi = false;
+
+    if (Cart) delete Cart;
+    Cart = nullptr;
+
+    NDSCart_SRAM::Reset();
+
+    ResetCart();
+}
+
+void DoSavestate(Savestate* file)
+{
+    file->Section("NDSC");
+
+    file->Var16(&SPICnt);
+    file->Var32(&ROMCnt);
+
+    file->VarArray(ROMCommand, 8);
+    file->Var32(&ROMData);
+
+    file->VarArray(TransferData, 0x4000);
+    file->Var32(&TransferPos);
+    file->Var32(&TransferLen);
+    file->Var32(&TransferDir);
+    file->VarArray(TransferCmd, 8);
+
+    // cart inserted/len/ROM/etc should be already populated
+    // savestate should be loaded after the right game is loaded
+    // (TODO: system to verify that indeed the right ROM is loaded)
+    // (what to CRC? whole ROM? code binaries? latter would be more convenient for ie. romhaxing)
+
+    //file->Var32(&CmdEncMode);
+    //file->Var32(&DataEncMode);
+
+    // TODO: check KEY1 shit??
+
+    NDSCart_SRAM::DoSavestate(file);
 }
 
 
@@ -933,6 +1788,11 @@ bool LoadROMCommon(u32 filelength, const char *sram, bool direct)
     if (CartIsDSi)
         CartID |= 0x40000000;
 
+    // cart ID for Jam with the Band
+    // TODO: this kind of ID triggers different KEY1 phase
+    // (repeats commands a bunch of times)
+    //CartID = 0x88017FEC;
+
     printf("Cart ID: %08X\n", CartID);
 
     u32 arm9base = *(u32*)&CartROM[0x20];
@@ -961,41 +1821,53 @@ bool LoadROMCommon(u32 filelength, const char *sram, bool direct)
     if ((arm9base < 0x4000) || (gamecode == 0x23232323))
     {
         CartIsHomebrew = true;
-        if (Config::DLDIEnable)
-            ApplyDLDIPatch(melonDLDI, sizeof(melonDLDI));
-    }
-
-    if (direct)
-    {
-        // TODO: in the case of an already-encrypted secure area, direct boot
-        // needs it decrypted
-        NDS::SetupDirectBoot();
-        CmdEncMode = 2;
+        //if (Config::DLDIEnable)
+        //    ApplyDLDIPatch(melonDLDI, sizeof(melonDLDI));
     }
 
     CartInserted = true;
 
     // TODO: support more fancy cart types (homebrew?, flashcarts, etc)
-    if (CartIsHomebrew)
+    /*if (CartIsHomebrew)
         ROMCommandHandler = ROMCommand_Homebrew;
     else if (CartID & 0x08000000)
         ROMCommandHandler = ROMCommand_RetailNAND;
     else
-        ROMCommandHandler = ROMCommand_Retail;
+        ROMCommandHandler = ROMCommand_Retail;*/
+    // TODO: add case for pokémon typing game
+    if (CartIsHomebrew)
+        Cart = new CartHomebrew(CartROM, CartROMSize, CartID);
+    else if (CartID & 0x08000000)
+        Cart = new CartRetailNAND(CartROM, CartROMSize, CartID);
+    //else if (CartID & 0x00010000)
+    //    Cart = new CartRetailIR(CartROM, CartROMSize, CartID);
+    else
+        Cart = new CartRetail(CartROM, CartROMSize, CartID);
+
+    if (Cart)
+    {
+        Cart->Reset();
+        if (direct)
+        {
+            NDS::SetupDirectBoot();
+            Cart->SetupDirectBoot();
+        }
+    }
 
     // encryption
     Key1_InitKeycode(false, gamecode, 2, 2);
 
     // save
     printf("Save file: %s\n", sram);
-    NDSCart_SRAM::LoadSave(sram, romparams.SaveMemType);
+    //NDSCart_SRAM::LoadSave(sram, romparams.SaveMemType);
+    if (Cart) Cart->LoadSave(sram, romparams.SaveMemType);
 
-    if (CartIsHomebrew && Config::DLDIEnable)
+    /*if (CartIsHomebrew && Config::DLDIEnable)
     {
         CartSD = Platform::OpenLocalFile(Config::DLDISDPath, "r+b");
     }
     else
-        CartSD = NULL;
+        CartSD = NULL;*/
 
     return true;
 }
@@ -1050,12 +1922,14 @@ bool LoadROM(const u8* romdata, u32 filelength, const char *sram, bool direct)
 void RelocateSave(const char* path, bool write)
 {
     // herp derp
-    NDSCart_SRAM::RelocateSave(path, write);
+    //NDSCart_SRAM::RelocateSave(path, write);
+    if (Cart) Cart->RelocateSave(path, write);
 }
 
 void FlushSRAMFile()
 {
-    NDSCart_SRAM::FlushSRAMFile();
+    //NDSCart_SRAM::FlushSRAMFile();
+    if (Cart) Cart->FlushSRAMFile();
 }
 
 int ImportSRAM(const u8* data, u32 length)
@@ -1078,6 +1952,10 @@ void ResetCart()
     SPICnt = 0;
     ROMCnt = 0;
 
+    SPIData = 0;
+    SPIDataPos = 0;
+    SPIHold = false;
+
     memset(ROMCommand, 0, 8);
     ROMData = 0;
 
@@ -1091,11 +1969,13 @@ void ResetCart()
     memset(TransferCmd, 0, 8);
     TransferCmd[0] = 0xFF;
 
-    CmdEncMode = 0;
-    DataEncMode = 0;
+    //CmdEncMode = 0;
+    //DataEncMode = 0;
+
+    if (Cart) Cart->Reset();
 }
 
-void ReadROM(u32 addr, u32 len, u32 offset)
+/*void ReadROM(u32 addr, u32 len, u32 offset)
 {
     if (!CartInserted) return;
 
@@ -1118,7 +1998,7 @@ void ReadROM_B7(u32 addr, u32 len, u32 offset)
     }
 
     memcpy(TransferData+offset, CartROM+addr, len);
-}
+}*/
 
 
 void ROMEndTransfer(u32 param)
@@ -1126,9 +2006,9 @@ void ROMEndTransfer(u32 param)
     ROMCnt &= ~(1<<31);
 
     if (SPICnt & (1<<14))
-        NDS::SetIRQ((NDS::ExMemCnt[0]>>11)&0x1, NDS::IRQ_CartSendDone);
+        NDS::SetIRQ((NDS::ExMemCnt[0]>>11)&0x1, NDS::IRQ_CartXferDone);
 
-    if (TransferDir == 1)
+    /*if (TransferDir == 1)
     {
         // finish a write
 
@@ -1148,7 +2028,8 @@ void ROMEndTransfer(u32 param)
             }
             break;
         }
-    }
+    }*/
+    if (Cart) Cart->ROMCommandFinish(TransferCmd, TransferData, TransferLen);
 }
 
 void ROMPrepareData(u32 param)
@@ -1172,7 +2053,7 @@ void ROMPrepareData(u32 param)
 }
 
 
-void ROMCommand_Retail(u8* cmd)
+/*void ROMCommand_Retail(u8* cmd)
 {
     switch (cmd[0])
     {
@@ -1297,7 +2178,7 @@ void ROMCommand_Homebrew(u8* cmd)
         printf("unknown homebrew cart command %02X\n", cmd[0]);
         break;
     }
-}
+}*/
 
 
 void WriteROMCnt(u32 val)
@@ -1306,6 +2187,8 @@ void WriteROMCnt(u32 val)
 
     if (!(SPICnt & (1<<15))) return;
 
+    // all this junk would only really be useful if melonDS was interfaced to
+    // a DS cart reader
     if (val & (1<<15))
     {
         u32 snum = (NDS::ExMemCnt[0]>>8)&0x8;
@@ -1337,35 +2220,36 @@ void WriteROMCnt(u32 val)
     TransferPos = 0;
     TransferLen = datasize;
 
+    *(u32*)&TransferCmd[0] = *(u32*)&ROMCommand[0];
+    *(u32*)&TransferCmd[4] = *(u32*)&ROMCommand[4];
+
     // handle KEY1 encryption as needed.
     // KEY2 encryption is implemented in hardware and doesn't need to be handled.
-    u8 cmd[8];
-    if (CmdEncMode == 1 || CmdEncMode == 11)
+    /*if (CmdEncMode == 1 || CmdEncMode == 11)
     {
-        *(u32*)&cmd[0] = ByteSwap(*(u32*)&ROMCommand[4]);
-        *(u32*)&cmd[4] = ByteSwap(*(u32*)&ROMCommand[0]);
-        Key1_Decrypt((u32*)cmd);
-        u32 tmp = ByteSwap(*(u32*)&cmd[4]);
-        *(u32*)&cmd[4] = ByteSwap(*(u32*)&cmd[0]);
-        *(u32*)&cmd[0] = tmp;
+        *(u32*)&TransferCmd[0] = ByteSwap(*(u32*)&ROMCommand[4]);
+        *(u32*)&TransferCmd[4] = ByteSwap(*(u32*)&ROMCommand[0]);
+        Key1_Decrypt((u32*)TransferCmd);
+        u32 tmp = ByteSwap(*(u32*)&TransferCmd[4]);
+        *(u32*)&TransferCmd[4] = ByteSwap(*(u32*)&TransferCmd[0]);
+        *(u32*)&TransferCmd[0] = tmp;
     }
     else
     {
-        *(u32*)&cmd[0] = *(u32*)&ROMCommand[0];
-        *(u32*)&cmd[4] = *(u32*)&ROMCommand[4];
+
     }
 
-    /*printf("ROM COMMAND %04X %08X %02X%02X%02X%02X%02X%02X%02X%02X SIZE %04X\n",
+    printf("ROM COMMAND %04X %08X %02X%02X%02X%02X%02X%02X%02X%02X SIZE %04X\n",
            SPICnt, ROMCnt,
-           cmd[0], cmd[1], cmd[2], cmd[3],
-           cmd[4], cmd[5], cmd[6], cmd[7],
+           TransferCmd[0], TransferCmd[1], TransferCmd[2], TransferCmd[3],
+           TransferCmd[4], TransferCmd[5], TransferCmd[6], TransferCmd[7],
            datasize);*/
 
     // default is read
     // commands that do writes will change this
     TransferDir = 0;
 
-    switch (cmd[0])
+    /*switch (cmd[0])
     {
     case 0x9F:
         memset(TransferData, 0xFF, TransferLen);
@@ -1440,7 +2324,11 @@ void WriteROMCnt(u32 val)
         else if (ROMCommandHandler)
             ROMCommandHandler(cmd);
         break;
-    }
+    }*/
+    // TODO: how should we detect that the transfer should be a write?
+    // you're supposed to set bit30 of ROMCNT for a write, but it's also
+    // possible to do reads just fine when that bit is set
+    if (Cart) TransferDir = Cart->ROMCommandStart(TransferCmd, TransferData, TransferLen);
 
     ROMCnt &= ~(1<<23);
 
@@ -1454,6 +2342,7 @@ void WriteROMCnt(u32 val)
     u32 cmddelay = 8;
 
     // delays are only applied when the WR bit is cleared
+    // CHECKME: do the delays apply at the end (instead of start) when WR is set?
     if (!(ROMCnt & (1<<30)))
     {
         cmddelay += (ROMCnt & 0x1FFF);
@@ -1533,7 +2422,8 @@ u8 ReadSPIData()
     if (!(SPICnt & (1<<13))) return 0;
     if (SPICnt & (1<<7)) return 0; // checkme
 
-    return NDSCart_SRAM::Read();
+    //return NDSCart_SRAM::Read();
+    return SPIData;
 }
 
 void WriteSPIData(u8 val)
@@ -1544,7 +2434,29 @@ void WriteSPIData(u8 val)
     if (SPICnt & (1<<7)) printf("!! WRITING AUXSPIDATA DURING PENDING TRANSFER\n");
 
     SPICnt |= (1<<7);
-    NDSCart_SRAM::Write(val, SPICnt&(1<<6));
+    //NDSCart_SRAM::Write(val, SPICnt&(1<<6));
+
+    bool hold = SPICnt&(1<<6);
+    bool islast = false;
+    if (!hold)
+    {
+        if (SPIHold) SPIDataPos++;
+        else         SPIDataPos = 0;
+        islast = true;
+        SPIHold = false;
+    }
+    else if (hold && (!SPIHold))
+    {
+        SPIHold = true;
+        SPIDataPos = 0;
+    }
+    else
+    {
+        SPIDataPos++;
+    }
+
+    if (Cart) SPIData = Cart->SPIWrite(val, SPIDataPos, islast);
+    else      SPIData = val; // checkme
 
     // SPI transfers one bit per cycle -> 8 cycles per byte
     u32 delay = 8 * (8 << (SPICnt & 0x3));
