@@ -761,6 +761,12 @@ u8 CartCommon::SPIWrite(u8 val, u32 pos, bool last)
     return 0xFF;
 }
 
+void CartCommon::SetIRQ()
+{
+    NDS::SetIRQ(0, NDS::IRQ_CartIREQMC);
+    NDS::SetIRQ(1, NDS::IRQ_CartIREQMC);
+}
+
 void CartCommon::ReadROM(u32 addr, u32 len, u8* data, u32 offset)
 {
     if (addr >= ROMLength) return;
@@ -801,7 +807,14 @@ void CartRetail::LoadSave(const char* path, u32 type)
     SRAMPath[1023] = '\0';
 
     if (type > 9) type = 0;
-    int sramlen[] = {0, 512, 8192, 65536, 128*1024, 256*1024, 512*1024, 1024*1024, 8192*1024, 8192*1024};
+    int sramlen[] =
+    {
+        0,
+        512,
+        8192, 65536, 128*1024,
+        256*1024, 512*1024, 1024*1024,
+        8192*1024, 16384*1024
+    };
     SRAMLength = sramlen[type];
 
     if (SRAMLength)
@@ -830,8 +843,8 @@ void CartRetail::LoadSave(const char* path, u32 type)
     case 4: SRAMType = 2; break; // EEPROM, regular
     case 5:
     case 6:
-    case 7:
-    case 8: SRAMType = 3; break; // FLASH
+    case 7: SRAMType = 3; break; // FLASH
+    case 8:
     case 9: SRAMType = 4; break; // NAND
     default: SRAMType = 0; break; // ...whatever else
     }
@@ -1368,7 +1381,76 @@ u8 CartRetailNAND::SPIWrite(u8 val, u32 pos, bool last)
 }
 
 
-//
+CartRetailIR::CartRetailIR(u8* rom, u32 len, u32 chipid, u32 irversion) : CartRetail(rom, len, chipid)
+{
+    IRVersion = irversion;
+}
+
+CartRetailIR::~CartRetailIR()
+{
+}
+
+void CartRetailIR::Reset()
+{
+    IRCmd = 0;
+}
+
+void CartRetailIR::DoSavestate(Savestate* file)
+{
+    // TODO?
+}
+
+u8 CartRetailIR::SPIWrite(u8 val, u32 pos, bool last)
+{
+    if (pos == 0)
+    {
+        IRCmd = val;
+        return val;
+    }
+
+    // TODO: emulate actual IR comm
+
+    switch (IRCmd)
+    {
+    case 0x00: // pass-through
+        return CartRetail::SPIWrite(val, pos-1, last);
+
+    case 0x08: // ID
+        return 0xAA;
+    }
+}
+
+
+CartRetailBT::CartRetailBT(u8* rom, u32 len, u32 chipid) : CartRetail(rom, len, chipid)
+{
+    printf("POKETYPE CART\n");
+}
+
+CartRetailBT::~CartRetailBT()
+{
+}
+
+void CartRetailBT::Reset()
+{
+}
+
+void CartRetailBT::DoSavestate(Savestate* file)
+{
+    // TODO?
+}
+
+u8 CartRetailBT::SPIWrite(u8 val, u32 pos, bool last)
+{
+    printf("POKETYPE SPI: %02X %d %d\n", val, pos, last);
+
+    if (pos == 0)
+    {
+        // TODO do something with it??
+        SetIRQ();
+    }
+
+    return 0;
+}
 
 
 CartHomebrew::CartHomebrew(u8* rom, u32 len, u32 chipid) : CartCommon(rom, len, chipid)
@@ -1782,7 +1864,7 @@ bool LoadROMCommon(u32 filelength, const char *sram, bool direct)
     else
         CartID |= (0x100 - (CartROMSize >> 28)) << 8;
 
-    if (romparams.SaveMemType == 8)
+    if (romparams.SaveMemType == 8 || romparams.SaveMemType == 9)
         CartID |= 0x08000000; // NAND flag
 
     if (CartIsDSi)
@@ -1792,6 +1874,7 @@ bool LoadROMCommon(u32 filelength, const char *sram, bool direct)
     // TODO: this kind of ID triggers different KEY1 phase
     // (repeats commands a bunch of times)
     //CartID = 0x88017FEC;
+    //CartID = 0x80007FC2; // pokémon typing adventure
 
     printf("Cart ID: %08X\n", CartID);
 
@@ -1827,6 +1910,15 @@ bool LoadROMCommon(u32 filelength, const char *sram, bool direct)
 
     CartInserted = true;
 
+    u32 irversion = 0;
+    if ((gamecode & 0xFF) == 'I')
+    {
+        if (((gamecode >> 8) & 0xFF) < 'P')
+            irversion = 1; // Active Health / Walk with Me
+        else
+            irversion = 2; // Pokémon HG/SS, B/W, B2/W2
+    }
+
     // TODO: support more fancy cart types (homebrew?, flashcarts, etc)
     /*if (CartIsHomebrew)
         ROMCommandHandler = ROMCommand_Homebrew;
@@ -1839,8 +1931,10 @@ bool LoadROMCommon(u32 filelength, const char *sram, bool direct)
         Cart = new CartHomebrew(CartROM, CartROMSize, CartID);
     else if (CartID & 0x08000000)
         Cart = new CartRetailNAND(CartROM, CartROMSize, CartID);
-    //else if (CartID & 0x00010000)
-    //    Cart = new CartRetailIR(CartROM, CartROMSize, CartID);
+    else if (irversion != 0)
+        Cart = new CartRetailIR(CartROM, CartROMSize, CartID, irversion);
+    else if ((gamecode & 0xFFFFFF) == 0x505A55) // UZPx
+        Cart = new CartRetailBT(CartROM, CartROMSize, CartID);
     else
         Cart = new CartRetail(CartROM, CartROMSize, CartID);
 
